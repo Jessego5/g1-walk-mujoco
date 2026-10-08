@@ -1,0 +1,8 @@
+mujoco
+torch
+rsl-rl-lib==5.5.1
+numpy
+matplotlib
+tensorboard
+imageio
+imageio-ffmpeg

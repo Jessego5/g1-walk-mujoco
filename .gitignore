@@ -1,0 +1,15 @@
+.venv/
+reference/
+__pycache__/
+.DS_Store
+
+# keep only TensorBoard logs, exported policies, and the checkpoints the README uses
+logs/*
+!logs/g1/
+logs/g1/*/*
+!logs/g1/*/events.out.tfevents.*
+!logs/g1/*/policy.pt
+!logs/g1/run1_full/model_600.pt
+!logs/g1/run1_full/model_2999.pt
+!logs/g1/run1_dr/model_3998.pt
+!logs/g1/run2_minimal/model_599.pt
