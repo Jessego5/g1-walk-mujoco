@@ -13,3 +13,5 @@ logs/g1/*/*
 !logs/g1/run1_full/model_2999.pt
 !logs/g1/run1_dr/model_3998.pt
 !logs/g1/run2_minimal/model_599.pt
+
+CLAUDE.md

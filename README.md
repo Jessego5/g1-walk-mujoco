@@ -19,7 +19,10 @@ source .venv/bin/activate
 python train.py --iters 3000 --envs 1024 --name run1_full        # ~80 min on an M4 MacBook
 tensorboard --logdir logs/g1                                     # live curves (optional)
 python plot_curves.py logs/g1/run1_full                          # -> results/curves.png
-python play.py logs/g1/run1_full/model_2999.pt                   # -> logs/g1/run1_full/walk.mp4
+uv pip install 'imageio[ffmpeg]'                                 # install in the active environment; required for MP4 output
+python play.py logs/g1/run1_full/model_2999.pt                   # -> logs/g1/run1_full/walk.mp4 (requires imageio[ffmpeg])
+# If MP4 writing fails in imageio's PyAV plugin with `expected bytes, NoneType found`, remove PyAV so imageio uses its FFmpeg backend:
+uv pip uninstall av
 ./view.sh logs/g1/run1_full/model_2999.pt --seconds 60           # live viewer window
 python play.py --unitree                                         # Unitree's pretrained policy, for comparison
 python train.py --dr --resume logs/g1/run1_full/model_2999.pt --iters 1000 --name run1_dr  # robustness stage
