@@ -29,6 +29,51 @@ python train.py --dr --resume logs/g1/run1_full/model_2999.pt --iters 1000 --nam
 python evaluate.py logs/g1/run1_dr/model_3998.pt --dr           # % of 256 robots that fall in 20 s
 ```
 
+### Train with our own PPO (`train_ppo.py`)
+
+`train_ppo.py` is a drop-in alternative to `train.py` that uses `g1_walk/ppo.py`, a PPO written from scratch
+instead of rsl_rl's runner (details in [Custom PPO](#custom-ppo)). Same flags, same logs layout, same TensorBoard tags.
+
+```bash
+python train_ppo.py --iters 600 --envs 1024 --name custom_full                                            # stage 1, ~15-20 min on an M4
+python train_ppo.py --dr --resume logs/g1/custom_full/model_599.pt --iters 1000 --name custom_dr           # stage 2: domain randomization
+python plot_curves.py logs/g1/run1_full logs/g1/custom_full --out results/custom_vs_rsl.png                # overlay against the rsl_rl run
+python evaluate.py logs/g1/custom_dr/model_1599.pt --dr                                                    # robustness test, same as before
+python play.py logs/g1/custom_dr/model_1599.pt                                                             # works with either checkpoint format
+```
+
+`--resume` only loads checkpoints written by `train_ppo.py` (they carry a `custom_ppo` marker). rsl_rl checkpoints
+from `train.py` can't be resumed here, so the DR stage needs a custom stage-1 run first. A resumed run continues the
+iteration count (resuming `model_599.pt` for 1000 iterations ends at `model_1599.pt`).
+
+### Random scenarios (`play.py --scenarios`)
+
+Stress-test a policy with random events while it walks, with visuals so you can see what is happening to the robot:
+
+```bash
+python play.py logs/g1/custom_dr/model_1599.pt --scenarios --dr                           # video -> logs/g1/custom_dr/walk.mp4
+./view.sh logs/g1/custom_dr/model_1599.pt --scenarios --dr --seconds 60                   # live viewer window
+python play.py logs/g1/custom_dr/model_1599.pt --scenarios --seed 1 --event-every 6       # fewer events, replayable
+```
+
+| Flag | Meaning |
+|---|---|
+| `--scenarios` | every ~3 s a random event: a new velocity command (20% chance of a full stop) or a thrown ball |
+| `--dr` | randomize friction, pelvis mass and motor strength, plus sensor noise (values printed; re-rolled after a fall) |
+| `--event-every S` | mean seconds between events (default 3) |
+| `--seed N` | the seed is always printed, so any run can be replayed |
+| `--seconds S` | length (default 30 in this mode, 10 otherwise) |
+
+What you see in the video / viewer:
+- **orange ball** flies at the robot for 0.6 s; the console prints `THROW` at launch and `HIT` on arrival
+- **red arrow** points into the robot from the side the ball came from, longer for harder hits (0.3-1.2 m/s)
+- **green arrow** above the pelvis shows the commanded walking direction
+- a fall prints how long after which event it happened, and the robot respawns standing
+
+The ball and arrows are render-only. On arrival, the robot's base xy velocity is *set* to the hit speed, the same
+kick used in training and `evaluate.py`; it is not a physical collision (adding bodies would change the simulation
+state size the env relies on). Run once without `--dr` to tell randomization effects from shove effects.
+
 ## How the pipeline fits together
 
 ```
@@ -55,7 +100,9 @@ python evaluate.py logs/g1/run1_dr/model_3998.pt --dr           # % of 256 robot
 | `g1_walk/physics.py` | Loads the G1 model, turns motors into PD actuators, steps many robots in parallel worker processes |
 | `g1_walk/env.py` | The RL task: builds observations, computes rewards, detects falls, resets, randomizes |
 | `train.py` | Plugs the env into rsl_rl's PPO runner; saves checkpoints and TensorBoard logs |
-| `play.py` | Deterministic rollout (policy mean, no noise) → video or live viewer |
+| `g1_walk/ppo.py` | Our own PPO: normalizers, actor-critic, rollout buffer, GAE, clipped update, adaptive LR, logging, export |
+| `train_ppo.py` | Same CLI as `train.py`, but trains with `g1_walk/ppo.py` |
+| `play.py` | Deterministic rollout (policy mean, no noise) → video or live viewer; loads rsl_rl or custom checkpoints; `--scenarios` adds random commands and thrown-ball shoves with overlays |
 | `plot_curves.py` | Reward / episode-length / fall-rate plots from TensorBoard logs |
 | `evaluate.py` | Robustness test: % of robots that fall in 20 s, with or without randomization |
 | `gait_stats.py` | Gait-quality numbers (foot clearance, slip, jitter, ...) to compare policies |
@@ -176,6 +223,43 @@ Takeaways:
 - Recovering from strong shoves is the remaining weakness. Unitree trains ~10,000 iterations × 4,096 envs
   (~1B samples, GPU); we used ~100M. More iterations (or a push curriculum that ramps 0.5 → 1.5 m/s) is the
   obvious next step, and a good use of GPU time.
+
+## Custom PPO
+
+`g1_walk/ppo.py` re-implements rsl_rl 5.5.1's PPO semantics from scratch, so a run is directly comparable with
+`train.py`. It reads the same `train_cfg()`, so no hyperparameters are duplicated. The details that matter (each
+one silently changes the learning curve if missed):
+
+- **Observations:** the actor sees the 47 `policy` values; the critic sees those plus the privileged base velocity (50).
+- **Normalizers:** separate running mean/std for actor and critic, `(x - mean) / (std + 0.01)`, updated only *after*
+  the optimization pass using the whole rollout, so the policy ratio is exactly 1 at epoch 0 (asserted at runtime).
+- **Policy:** MLP [256, 128, 128] with ELU; a learned *scalar* std per action (init 0.8), not log-std; log-prob and
+  entropy summed over the 12 actions.
+- **Timeouts:** `r += γ·V(s_t)` for timed-out robots (the env auto-resets, so the next obs can't be used); any done
+  cuts GAE. Advantages are normalized over the whole rollout.
+- **Update:** 5 epochs × 4 minibatches, clipped surrogate and clipped value loss (0.2), one Adam, gradient-norm clip
+  1.0 applied to actor and critic separately, and the adaptive learning rate driven by the closed-form Gaussian KL
+  per minibatch (÷1.5 above 2×0.01, ×1.5 below 0.01/2, bounded to [1e-5, 1e-2]).
+- **Logging / export:** same TensorBoard tags as rsl_rl (`plot_curves.py` overlays both). Checkpoints are
+  `model_<it>.pt`; `policy.pt` is a TorchScript actor (raw 47-d obs → action mean, normalizer baked in).
+
+**Results** (M4 MacBook Pro, 1024 robots, seed 0; ~21k steps/s during training):
+
+*Stage 1* (`custom_full`, 600 iterations): mean episode length jumps from ~95 steps (iteration 50) to ~943
+(iteration 100), reward reaches ~27 and velocity tracking ~0.8-0.85 by iteration 600, on top of the `run1_full`
+curves (`results/custom_vs_rsl.png`). Deterministic 10 s rollout at a 0.5 m/s command: 0.50 m/s, 0 falls.
+
+*Stage 2* (`custom_dr`, +1000 iterations with domain randomization), `evaluate.py`, 256 robots, % that fell in 20 s:
+
+| Policy | Nominal | `--dr` (friction, mass, motors, noise, shoves up to 1.5 m/s) |
+|---|---|---|
+| Stage 1 (`custom_full/model_599`) | 3.1% | 100% |
+| Stage 2 (`custom_dr/model_1599`) | 0.4% | 94.5% |
+
+This is in line with the rsl_rl numbers above (stage 1 falls 100%; stage 2 falls 91% at 1.5 m/s shoves), but it is not
+a like-for-like comparison: the custom runs used 600 + 1000 iterations against 3000 + 1000 for rsl_rl, and nominal
+velocity error is 0.19 m/s against 0.109 m/s. `evaluate.py --dr` bundles every perturbation, so the per-condition
+rows (noise only, friction/mass/motors only, smaller shoves) have not been reproduced for the custom policy.
 
 ## Minimal vs. full reward
 
